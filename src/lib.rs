@@ -1,6 +1,14 @@
+use getset::{Getters, Setters};
 use rand::Rng;
+use std::collections::HashMap;
+use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+pub trait Report {
+    fn print_report(&self);
+}
+
+#[derive(Debug)]
 pub struct SmartThermometer {
     name: String,
     location: String,
@@ -38,6 +46,7 @@ impl Display for SmartThermometer {
     }
 }
 
+#[derive(Debug)]
 pub struct SmartSocket {
     pub name: String,
     pub is_on: bool,
@@ -86,13 +95,23 @@ impl Display for SmartSocket {
     }
 }
 
+#[derive(Debug)]
 pub enum SmartDevice {
     Thermometer(SmartThermometer),
     Socket(SmartSocket),
 }
 
 impl SmartDevice {
-    pub fn print_status(&self) {
+    pub fn name(&self) -> String {
+        match self {
+            SmartDevice::Thermometer(t) => t.name.clone(),
+            SmartDevice::Socket(s) => s.name.clone(),
+        }
+    }
+}
+
+impl Report for SmartDevice {
+    fn print_report(&self) {
         match self {
             SmartDevice::Thermometer(t) => println!("{}", t),
             SmartDevice::Socket(s) => println!("{}", s),
@@ -100,58 +119,139 @@ impl SmartDevice {
     }
 }
 
+#[derive(Debug, Getters, Setters)]
 pub struct Room {
-    pub name: String,
-    devices: Vec<SmartDevice>,
+    #[getset(get = "pub")]
+    name: String,
+    devices: HashMap<String, SmartDevice>,
 }
 
 impl Room {
-    pub fn new(name: &str, devices: Vec<SmartDevice>) -> Self {
+    pub fn new(name: &str, devices: HashMap<String, SmartDevice>) -> Self {
         Self {
             name: name.to_string(),
             devices,
         }
     }
 
-    pub fn get_device(&self, idx: usize) -> &SmartDevice {
-        self.devices
-            .get(idx)
-            .expect("Индекс устройства вне диапазона")
+    pub fn add_device(&mut self, device: SmartDevice) {
+        self.devices.insert(device.name().clone(), device);
     }
 
-    pub fn get_device_mut(&mut self, idx: usize) -> &mut SmartDevice {
-        self.devices
-            .get_mut(idx)
-            .expect("Индекс устройства вне диапазона")
+    pub fn remove_device(&mut self, device_name: &str) -> Option<SmartDevice> {
+        self.devices.remove(device_name)
     }
 
-    pub fn print_report(&self) {
-        println!("Отчёт для комнаты '{}':", self.name);
-        self.devices.iter().for_each(|dev| dev.print_status());
+    pub fn get_device(&self, key: &str) -> Option<&SmartDevice> {
+        self.devices.get(key)
+    }
+
+    pub fn get_device_mut(&mut self, key: &str) -> Option<&mut SmartDevice> {
+        self.devices.get_mut(key)
     }
 }
 
+impl Report for Room {
+    fn print_report(&self) {
+        println!("Отчёт для комнаты '{}':", self.name);
+        self.devices.values().for_each(|dev| dev.print_report());
+    }
+}
+
+#[derive(Debug)]
 pub struct SmartHouse {
-    rooms: Vec<Room>,
+    rooms: HashMap<String, Room>,
 }
 
 impl SmartHouse {
-    pub fn new(rooms: Vec<Room>) -> Self {
+    pub fn new(rooms: HashMap<String, Room>) -> Self {
         Self { rooms }
     }
 
-    pub fn get_room(&self, idx: usize) -> &Room {
-        self.rooms.get(idx).expect("Индекс комнаты вне диапазона")
+    pub fn get_room(&self, key: &str) -> Option<&Room> {
+        self.rooms.get(key)
     }
 
-    pub fn get_room_mut(&mut self, idx: usize) -> &mut Room {
-        self.rooms
-            .get_mut(idx)
-            .expect("Индекс комнаты вне диапазона")
+    pub fn get_room_mut(&mut self, key: &str) -> Option<&mut Room> {
+        self.rooms.get_mut(key)
     }
 
-    pub fn print_report(&self) {
+    pub fn add_room(&mut self, room: Room) {
+        self.rooms.insert(room.name().clone(), room);
+    }
+
+    pub fn remove_room(&mut self, key: &str) -> Option<Room> {
+        self.rooms.remove(key)
+    }
+
+    pub fn get_device(
+        &self,
+        room_name: &str,
+        device_name: &str,
+    ) -> Result<&SmartDevice, SmartHouseError> {
+        self
+            .rooms
+            .get(room_name)
+            .ok_or_else(|| SmartHouseError::RoomNotFound(room_name.to_string()))?
+            .devices
+            .get(device_name)
+            .ok_or_else(|| SmartHouseError::DeviceNotFound {
+                room: room_name.to_string(),
+                device: device_name.to_string(),
+            })
+    }
+
+    pub fn get_device_mut(
+        &mut self,
+        room_name: &str,
+        device_name: &str,
+    ) -> Result<&mut SmartDevice, SmartHouseError> {
+        self
+            .rooms
+            .get_mut(room_name)
+            .ok_or_else(|| SmartHouseError::RoomNotFound(room_name.to_string()))?
+            .devices
+            .get_mut(device_name)
+            .ok_or_else(|| SmartHouseError::DeviceNotFound {
+                room: room_name.to_string(),
+                device: device_name.to_string(),
+            })
+    }
+}
+
+impl Report for SmartHouse {
+    fn print_report(&self) {
         println!("== Отчёт по всему дому ==");
-        self.rooms.iter().for_each(|dev| dev.print_report());
+        self.rooms.values().for_each(|dev| dev.print_report());
     }
+}
+
+#[derive(Debug)]
+pub enum SmartHouseError {
+    RoomNotFound(String),
+    DeviceNotFound { room: String, device: String },
+}
+
+impl Display for SmartHouseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SmartHouseError::RoomNotFound(room) => write!(f, "Комната '{}' не найдена", room),
+            SmartHouseError::DeviceNotFound { room, device } => {
+                write!(f, "Устройство '{}' не найдено в комнате '{}'", device, room)
+            }
+        }
+    }
+}
+
+impl Error for SmartHouseError {}
+
+#[macro_export]
+macro_rules! room {
+    ( $room_name:expr,  $(($device_key:expr, $device:expr)),*$(,)?) => {
+        {
+            let mut temp_map = std::collections::HashMap::new();
+            $(temp_map.insert($device_key, $device);)*
+            $crate::Room::new($room_name, temp_map)
+        }
+    };
 }

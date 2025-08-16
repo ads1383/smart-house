@@ -2,16 +2,164 @@ use getset::{Getters, Setters};
 use rand::Rng;
 use std::collections::HashMap;
 use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
+use std::io::{Read, Write};
+use std::net::{TcpStream, TcpListener};
+use std::sync::{Arc, Mutex};
+use std::net::UdpSocket;
+use std::thread;
 
 pub trait Report {
     fn print_report(&self);
+}
+
+pub trait SocketDriver: Send + Sync + Debug {
+    fn turn_on(&mut self) -> Result<(), Box<dyn Error>>;
+    fn turn_off(&mut self) -> Result<(), Box<dyn Error>>;
+    fn is_on(&self) -> Result<bool, Box<dyn Error>>;
+    fn current_power(&self) -> Result<f32, Box<dyn Error>>;
+}
+
+pub trait ThermometerDriver: Send + Sync + Debug {
+    fn latest_temperature(&self) -> Result<f32, Box<dyn Error>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct TcpSocketDriver {
+    addr: String,
+}
+
+impl TcpSocketDriver {
+    pub fn new(addr: &str) -> Self {
+        Self { addr: addr.to_string() }
+    }
+
+    fn send_cmd(&self, cmd: &str) -> Result<String, Box<dyn Error>> {
+        let mut stream = TcpStream::connect(&self.addr)?;
+        stream.write_all(cmd.as_bytes())?;
+        stream.flush()?;
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+
+impl SocketDriver for TcpSocketDriver {
+    fn turn_on(&mut self) -> Result<(), Box<dyn Error>> {
+        self.send_cmd("ON")?;
+        Ok(())
+    }
+    fn turn_off(&mut self) -> Result<(), Box<dyn Error>> {
+        self.send_cmd("OFF")?;
+        Ok(())
+    }
+
+    fn is_on(&self) -> Result<bool, Box<dyn Error>> {
+        let resp = self.send_cmd("STATE")?;
+        Ok(resp.trim() == "ON")
+    }
+
+
+    fn current_power(&self) -> Result<f32, Box<dyn Error>> {
+        let resp = self.send_cmd("POWER")?;
+        Ok(resp.trim().parse()?)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MockSocketDriver {
+    state: Arc<Mutex<(bool, f32)>>,
+}
+
+impl MockSocketDriver {
+    pub fn new(initial_state: bool, power: f32) -> Self {
+        Self { state: Arc::new(Mutex::new((initial_state, power))) }
+    }
+}
+
+impl SocketDriver for MockSocketDriver {
+    fn turn_on(&mut self) -> Result<(), Box<dyn Error>> {
+        self.state.lock().unwrap().0 = true;
+        Ok(())
+    }
+    fn turn_off(&mut self) -> Result<(), Box<dyn Error>> {
+        self.state.lock().unwrap().0 = false;
+        Ok(())
+    }
+
+    fn is_on(&self) -> Result<bool, Box<dyn Error>> {
+        Ok(self.state.lock().unwrap().0)
+    }
+    fn current_power(&self) -> Result<f32, Box<dyn Error>> {
+        let (on, power) = *self.state.lock().unwrap();
+        Ok(if on { power } else { 0.0 })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UdpThermometerDriver {
+    latest_temp: Arc<Mutex<Option<f32>>>,
+}
+
+impl UdpThermometerDriver {
+    pub fn new(bind_addr: &str) -> Self {
+        let latest_temp = Arc::new(Mutex::new(None));
+        let latest_temp_clone = Arc::clone(&latest_temp);
+
+        let addr = bind_addr.to_string();
+        thread::spawn(move || {
+            let socket = UdpSocket::bind(&addr).expect("UDP bind failed");
+            socket.set_nonblocking(true).unwrap();
+            let mut buf = [0u8; 64];
+
+            loop {
+                if let Ok((len, _)) = socket.recv_from(&mut buf) {
+                    if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                        if let Ok(temp) = s.trim().parse::<f32>() {
+                            *latest_temp_clone.lock().unwrap() = Some(temp);
+                        }
+                    }
+                }
+                thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+
+        Self { latest_temp }
+    }
+}
+
+impl ThermometerDriver for UdpThermometerDriver {
+    fn latest_temperature(&self) -> Result<f32, Box<dyn Error>> {
+        self.latest_temp
+            .lock()
+            .unwrap()
+            .ok_or_else(|| "Нет данных от термометра".into())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MockThermometerDriver {
+    temp: f32,
+}
+
+impl MockThermometerDriver {
+    pub fn new(temp: f32) -> Self {
+        Self { temp }
+    }
+}
+
+impl ThermometerDriver for MockThermometerDriver {
+    fn latest_temperature(&self) -> Result<f32, Box<dyn Error>> {
+        Ok(self.temp)
+    }
 }
 
 #[derive(Debug)]
 pub struct SmartThermometer {
     name: String,
     location: String,
+    driver: Box<dyn ThermometerDriver>,
 }
 
 pub trait Thermometer {
@@ -19,18 +167,18 @@ pub trait Thermometer {
 }
 
 impl SmartThermometer {
-    pub fn new(name: &str, location: &str) -> Self {
+    pub fn new(name: &str, location: &str, driver: Box<dyn ThermometerDriver>) -> Self {
         Self {
             name: name.to_string(),
             location: location.to_string(),
+            driver
         }
     }
 }
 
 impl Thermometer for SmartThermometer {
     fn get_current_temperature(&self) -> f32 {
-        let rng = &mut rand::rng();
-        rng.random_range(0.0..30.0)
+        self.driver.latest_temperature().unwrap_or_else(|_| 0.0)
     }
 }
 
@@ -49,33 +197,31 @@ impl Display for SmartThermometer {
 #[derive(Debug)]
 pub struct SmartSocket {
     pub name: String,
-    pub is_on: bool,
-    pub power: f32,
+    driver: Box<dyn SocketDriver>
 }
 
 impl SmartSocket {
-    pub fn new(name: &str, is_on: bool, power: f32) -> Self {
+    pub fn new(name: &str, driver: Box<dyn SocketDriver>) -> Self {
         Self {
             name: name.to_string(),
-            is_on,
-            power,
+            driver,
         }
     }
 
     pub fn turn_on(&mut self) {
-        self.is_on = true;
+        self.driver.turn_on().expect("Ошибка включения розетки");
     }
 
     pub fn turn_off(&mut self) {
-        self.is_on = false;
+        self.driver.turn_off().expect("Ошибка выключения розетки");
     }
 
     pub fn is_on(&self) -> bool {
-        self.is_on
+        self.driver.is_on().unwrap_or_else(|_| false)
     }
 
     pub fn current_power(&self) -> f32 {
-        if self.is_on { self.power } else { 0.0 }
+        self.driver.current_power().unwrap_or_else(|_| 0.0)
     }
 }
 
@@ -85,7 +231,7 @@ impl Display for SmartSocket {
             f,
             "Розетка '{}' сейчас {}. Мощность: {:.1} Вт",
             self.name,
-            if self.is_on {
+            if self.is_on() {
                 "включена"
             } else {
                 "выключена"
@@ -254,4 +400,51 @@ macro_rules! room {
             $crate::Room::new($room_name, temp_map)
         }
     };
+}
+
+//Имитаторы
+
+//TCP-розетка
+pub fn run_socket_emulator(addr: &str, initial_power: f32) {
+    let listener = TcpListener::bind(addr).unwrap();
+    let state = Arc::new(Mutex::new((false, initial_power)));
+
+    for stream in listener.incoming() {
+        if let Ok(stream) = stream {
+            let st = Arc::clone(&state);
+            thread::spawn(move || handle_client(stream, st));
+        }
+    }
+}
+
+fn handle_client(mut stream: TcpStream, state: Arc<Mutex<(bool, f32)>>) {
+    let mut buf = [0u8; 64];
+    if let Ok(size) = stream.read(&mut buf) {
+        let cmd = String::from_utf8_lossy(&buf[..size]).trim().to_string();
+        let mut st = state.lock().unwrap();
+        match cmd.as_str() {
+            "ON" => { st.0 = true; let _ = stream.write_all(b"OK"); }
+            "OFF" => { st.0 = false; let _ = stream.write_all(b"OK"); }
+            "POWER" => {
+                let resp = if st.0 { st.1 } else { 0.0 };
+                let _ = stream.write_all(resp.to_string().as_bytes());
+            }
+            "STATE" => {
+                let resp = if st.0 { "ON" } else { "OFF" };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            _ => { let _ = stream.write_all(b"ERR"); }
+        }
+    }
+}
+
+//UDP-термометр
+pub fn run_thermometer_emulator(target_addr: &str, period_ms: u64) {
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    loop {
+        let temp = rand::random::<f32>() * 30.0;
+        let msg = format!("{:.2}", temp);
+        let _ = socket.send_to(msg.as_bytes(), target_addr);
+        thread::sleep(std::time::Duration::from_millis(period_ms));
+    }
 }
